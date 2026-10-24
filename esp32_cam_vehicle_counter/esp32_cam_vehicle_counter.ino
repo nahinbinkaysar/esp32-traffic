@@ -10,11 +10,11 @@
 #include <WiFi.h>
 
 // ===== Wi-Fi =====
-const char *WIFI_SSID = "AndroidAP6A70";
-const char *WIFI_PASS = "odyb2659";
+const char *WIFI_SSID = "YOUR_WIFI_NAME";
+const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 // ===== OLED =====
-// Common 0.96" SSD1306 I2C OLED: VCC, GND, SDA, SCL.
+// SH1106 I2C OLED (128x64): VCC, GND, SDA, SCL.
 // AI Thinker ESP32-CAM has very few spare pins. Use these only if SD card is not used.
 #define OLED_SDA 15
 #define OLED_SCL 14

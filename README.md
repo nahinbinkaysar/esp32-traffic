@@ -1,170 +1,92 @@
-# ESP32-CAM Vehicle Counter POC
+# ESP32-CAM Vehicle Counter
 
-This is a Level 1 proof-of-concept sketch for onboard vehicle counting with an ESP32-CAM.
+On-device vehicle counting on an AI Thinker ESP32-CAM. It doesn't use a neural network and doesn't stream to a server: every frame is processed on the microcontroller, which reports counts over Serial, to an OLED and to a small web dashboard.
 
-It does not run YOLO. It uses a lightweight virtual-gate algorithm:
+Built in one day as a proof of concept, and validated on recorded traffic video (see [Validation](#validation)).
 
-1. Capture `160x120` grayscale frames.
-2. Process only a fixed ROI.
-3. Compare the ROI against a slow background frame.
-4. Measure motion in three horizontal gate bands.
-5. Count one vehicle when motion activates the gates in order.
-6. Show the latest processed frame and count status in a small web page.
+## How it works
+
+1. **Capture.** 160x120 grayscale frames (QQVGA), about 10 to 15 per second.
+2. **Region of interest.** Only a fixed rectangle covering one lane is analysed.
+3. **Background model.** Each pixel is compared with a background frame, and a pixel counts as changed if it differs by more than a threshold. The background is updated as a slow running average, `bg = (15 * bg + frame) / 16`, but **only when the scene is quiet**: no gate is active and overall motion in the region is low. This keeps the reference stable under gradual lighting changes without absorbing a passing vehicle into the background.
+4. **Three gates.** Three horizontal bands sit inside the region. A gate is active when enough of its pixels have changed.
+5. **Counting state machine.** A vehicle is counted only when the gates activate **in order** (top, then middle, then bottom), so motion that touches a single gate, such as a pedestrian or flicker, isn't counted:
+   - `WAIT_FIRST` → `WAIT_SECOND` → `WAIT_THIRD` → count → `COOLDOWN`
+   - A partial sequence resets after 2.2 s (`STATE_TIMEOUT_MS`).
+   - `COOLDOWN` waits for the gates to clear (minimum 450 ms, maximum 1.6 s), and counts must be at least 900 ms apart (`MIN_COUNT_GAP_MS`). Both prevent one vehicle from being counted twice.
+6. **Interval reporting.** Counts are totalled per reporting interval: 30 s for demos, 5 min (`300000` ms) for traffic-count use.
+
+Frame processing runs in its own FreeRTOS task. The web server shares the latest frame and the event log through mutexes, so serving the dashboard doesn't block counting.
 
 ## Hardware
 
 - AI Thinker ESP32-CAM with PSRAM
 - FTDI programmer for upload
-- Stable 5V supply
-- 0.96 inch SSD1306 I2C OLED, usually `128x64`, address `0x3C`
+- Stable 5 V supply
+- SH1106 I2C OLED, 128x64, address `0x3C`
 
-OLED output is enabled in the sketch. Counts are also shown in Serial and the web page.
-
-## OLED Wiring
-
-For a common SSD1306 I2C OLED:
+OLED wiring (assumes the SD card is not used, since it shares these pins):
 
 ```text
-OLED VCC -> ESP32-CAM 3.3V
-OLED GND -> ESP32-CAM GND
-OLED SDA -> ESP32-CAM GPIO15
-OLED SCL -> ESP32-CAM GPIO14
-```
-
-Important: `GPIO14` and `GPIO15` are also used by the ESP32-CAM SD card interface. This wiring assumes you are not using the SD card.
-
-If your OLED does not show anything, try changing:
-
-```cpp
-#define OLED_ADDR 0x3C
-```
-
-to:
-
-```cpp
-#define OLED_ADDR 0x3D
+OLED VCC -> 3.3V
+OLED GND -> GND
+OLED SDA -> GPIO15
+OLED SCL -> GPIO14
 ```
 
 ## Setup
 
-1. Open `esp32_cam_vehicle_counter.ino` in Arduino IDE.
-2. Install/select ESP32 board support.
-3. Board: `AI Thinker ESP32-CAM`.
-4. Enable PSRAM if your board menu exposes it.
-5. Install Arduino libraries:
+1. Open `esp32_cam_vehicle_counter/esp32_cam_vehicle_counter.ino` in the Arduino IDE.
+2. Select board **AI Thinker ESP32-CAM** and enable PSRAM if the menu offers it.
+3. Install the **Adafruit SH110X** and **Adafruit GFX** libraries.
+4. Set `WIFI_SSID` and `WIFI_PASS`.
+5. Upload, open Serial Monitor at `115200`, and visit the printed IP address.
 
-```text
-Adafruit SSD1306
-Adafruit GFX Library
-```
+Set `ENABLE_OLED` to `0` to run without the display.
 
-6. Change:
+## Dashboard and endpoints
 
-```cpp
-const char *WIFI_SSID = "YOUR_WIFI_NAME";
-const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
-```
+| Endpoint | Purpose |
+|---|---|
+| `/` | Live debug dashboard: frame with ROI and gates, gate scores, counter state, event log |
+| `/frame.bmp` | Latest processed grayscale frame with overlays |
+| `/status.json` | Raw algorithm values: gate scores, occupancy, state, counts |
+| `/events.json` | Recent counts and interval summaries |
+| `POST /reset_count` | Reset counters |
+| `POST /reset_background` | Replace the background with the current frame |
 
-7. Upload.
-8. Open Serial Monitor at `115200`.
-9. Visit the printed IP address in a browser.
+The dashboard polls a BMP snapshot about every 1.6 s instead of running a full MJPEG stream, so the camera loop doesn't compete with video streaming.
 
-To temporarily disable OLED support:
+## Tuning
 
-```cpp
-#define ENABLE_OLED 0
-```
+| Constant | Effect |
+|---|---|
+| `ROI_X`, `ROI_Y`, `ROI_W`, `ROI_H` | Region covering one lane |
+| `PIXEL_DIFF_THRESHOLD` (24) | Brightness change for a pixel to count as changed |
+| `GATE_CHANGED_PIXELS_THRESHOLD` (55) | Changed pixels needed to activate a gate |
+| `ROI_CHANGED_PIXELS_THRESHOLD` (180) | Above this the scene isn't "quiet", so the background isn't updated |
+| `COUNT_BOTTOM_TO_TOP` | Counting direction (default: top to bottom) |
 
-## Demo Method
+- **Missed vehicles:** lower the thresholds, or move the region to where vehicles look larger and more separated.
+- **Double counts:** raise `GATE_CHANGED_PIXELS_THRESHOLD`, lengthen the cooldown, or narrow the region.
+- **All gates stuck active:** the region is too large or the thresholds too low. Press *Reset background*.
 
-For your current prototype:
+## Validation
 
-1. Play the traffic video full-screen on a laptop/monitor.
-2. Mount the ESP32-CAM so the image does not shake.
-3. Open the ESP32 web page.
-4. Tune the ROI constants until the red box covers one target lane/strip only.
-5. Tune thresholds until the green gates activate when a vehicle passes.
+The counter was validated by pointing the ESP32-CAM at recorded traffic video played full-screen on a monitor, then tuning the region and thresholds until the gates fired in sequence for passing vehicles and the event log matched the vehicles crossing the lane.
 
-Start with a 30-second report interval:
+It has **not** been tested on a real road, and its accuracy has not been measured against manual counts.
 
-```cpp
-const unsigned long REPORT_INTERVAL_MS = 30000;
-```
+## Limitations
 
-For the real 5-minute interval:
+- One lane, one direction, with a region and thresholds tuned by hand for a single camera view.
+- Sensitive to sudden lighting changes, shadows, reflections and camera shake; the background adapts only slowly and only when the scene is quiet.
+- Two vehicles close together, or one occluding another, can be counted as one.
+- Testing from a monitor adds screen flicker that a real camera wouldn't see, and misses real-world problems: weather, night, and vibration.
 
-```cpp
-const unsigned long REPORT_INTERVAL_MS = 300000;
-```
+## Next steps
 
-## Tuning Constants
-
-Main constants to tune:
-
-```cpp
-const int ROI_X = 69;
-const int ROI_Y = 37;
-const int ROI_W = 55;
-const int ROI_H = 41;
-
-const int PIXEL_DIFF_THRESHOLD = 24;
-const int GATE_CHANGED_PIXELS_THRESHOLD = 55;
-const int ROI_CHANGED_PIXELS_THRESHOLD = 180;
-```
-
-If it misses vehicles:
-
-- Lower `PIXEL_DIFF_THRESHOLD`.
-- Lower `GATE_CHANGED_PIXELS_THRESHOLD`.
-- Move the ROI to where vehicles appear larger and more separated.
-
-If it double-counts:
-
-- Increase `GATE_CHANGED_PIXELS_THRESHOLD`.
-- Increase `COOLDOWN_MS`.
-- Make the ROI narrower.
-
-If screen flicker causes false motion:
-
-- Increase `PIXEL_DIFF_THRESHOLD`.
-- Lower monitor brightness a little.
-- Keep the ESP32-CAM exposure stable by avoiding reflections.
-
-## Web Feed Performance
-
-The sketch does not use the standard MJPEG camera stream. The camera loop processes frames continuously and stores the latest grayscale frame in RAM. The web page asks for that latest frame as a BMP snapshot every 1600 ms, while status updates refresh faster.
-
-This still costs Wi-Fi and CPU time, but it is much cheaper than competing with the camera for full JPEG streaming. For best counting performance during a demo, keep only one browser tab open.
-
-If the feed lags badly:
-
-- Keep only one browser tab open.
-- Move the ESP32-CAM closer to the Wi-Fi router or hotspot.
-- Increase the `refreshFrame` interval in the dashboard JavaScript.
-- Watch `/status.json` instead of the image feed while tuning thresholds.
-
-## Verification Outputs
-
-Use these during tuning and supervisor demo:
-
-- `/` shows the live debug dashboard.
-- `/frame.bmp` shows the latest processed grayscale frame with ROI and gates overlaid.
-- `/status.json` shows raw algorithm values.
-- `/events.json` shows recent count and interval events.
-- Serial Monitor at `115200` prints every counted vehicle and every interval summary.
-
-On the dashboard:
-
-- `Gate scores` should rise when motion crosses the green bands.
-- `Gate active` should light up in order: `A -> B -> C` for bottom-to-top counting.
-- `Counter state` should move through `WAIT_FIRST_GATE`, `WAIT_SECOND_GATE`, `WAIT_THIRD_GATE`, then `COOLDOWN`.
-- `Event log` should add `COUNT +1` only after the full gate sequence is observed.
-
-If all three gates stay active constantly, the ROI is too large or thresholds are too low.
-If no gate becomes active, lower the thresholds or move the ROI closer to larger vehicles.
-
-If the count stays at `1`, check `Counter state`.
-
-- If it stays on `COOLDOWN`, the gates are not going inactive. Increase `GATE_CHANGED_PIXELS_THRESHOLD`, shrink the ROI, or press `Reset background`.
-- If it stays on `WAIT_SECOND_GATE`, Gate A is active but Gate B is not. Move the ROI/gates so vehicle motion crosses A then B.
-- If it stays on `WAIT_THIRD_GATE`, Gate C is not being activated. Move the ROI upward/downward or lower the threshold.
+- Measure precision and recall against manually counted ground truth.
+- Calibrate thresholds automatically from a quiet period.
+- Support multiple lanes and both directions.
+- Field-test on a real road with a fixed mount.
